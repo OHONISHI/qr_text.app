@@ -1,112 +1,90 @@
-import os
 import cv2
 import av
 import numpy as np
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
-st.set_page_config(page_title="QR Reader (WebRTC)", layout="centered")
-st.title("QRコード リアルタイム読み取り（MediaStream / WebRTC）")
+st.set_page_config(page_title="QR撮影（1枚スナップ）")
+st.title("QRコードを “撮影” して読み取る")
 
-# ----------------- ユーティリティ -----------------
+# ---- お好みのユーティリティ（簡略版） ----
 def digital_zoom_center(bgr, zoom=1.0):
-    if zoom <= 1.0:
-        return bgr
+    if zoom <= 1.0: return bgr
     h, w = bgr.shape[:2]
     nh, nw = int(h/zoom), int(w/zoom)
-    y1 = (h - nh)//2
-    x1 = (w - nw)//2
+    y1, x1 = (h-nh)//2, (w-nw)//2
     crop = bgr[y1:y1+nh, x1:x1+nw]
     return cv2.resize(crop, (w, h), interpolation=cv2.INTER_CUBIC)
 
-def preprocess_variants(bgr):
-    h, w = bgr.shape[:2]
-    max_side = max(h, w)
-    if max_side < 1000:
-        scale = 1000 / max_side
-        bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
-
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    den  = cv2.bilateralFilter(gray, 7, 75, 75)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(den)
-    blur = cv2.GaussianBlur(clahe, (0,0), 1.0)
-    sharp = cv2.addWeighted(clahe, 1.5, blur, -0.5, 0)
-    thr = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 31, 2)
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
-
-    return [
-        bgr,
-        cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR),
-        cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR),
+def decode_once(img_bgr):
+    det = cv2.QRCodeDetector()
+    # そのまま→グレイ→二値の簡易3パターン
+    variants = [
+        img_bgr,
+        cv2.cvtColor(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(cv2.adaptiveThreshold(
+            cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
+        ), cv2.COLOR_GRAY2BGR),
     ]
+    for var in variants:
+        # 複数QR
+        ok, infos, pts, _ = det.detectAndDecodeMulti(var)
+        if ok and any(infos):
+            texts = [t for t in infos if t]
+            return texts[0]
+        # 単一QR
+        txt, _, _ = det.detectAndDecode(var)
+        if txt:
+            return txt
+    return ""
 
-def decode_once(img_bgr, det):
-    for var in preprocess_variants(img_bgr):
-        for rot in [None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-            test = cv2.rotate(var, rot) if rot is not None else var
-
-            ok, infos, points, _ = det.detectAndDecodeMulti(test)
-            if ok and any(infos):
-                texts = [t for t in infos if t]
-                return texts[0], test, points
-
-            txt, pts, _ = det.detectAndDecode(test)
-            if txt:
-                return txt, test, np.array([pts]) if pts is not None else None
-    return "", None, None
-
-# ----------------- UI（調整用） -----------------
+# ---- UI ----
 c1, c2 = st.columns(2)
-zoom = c1.slider("デジタルズーム", 1.0, 2.5, 1.0, 0.1)
-want_draw_box = c2.checkbox("検出枠を描画", value=True)
-st.info("コツ：明るく・近づけて・正面から。取り込めた瞬間に自動で表示されます。")
+zoom = c1.slider("デジタルズーム", 1.0, 2.5, 1.2, 0.1)
+stop_after_shot = c2.checkbox("撮影後にカメラを停止", True)
+st.caption("プレビューで構図を合わせ、📸 撮影 を押すとその1枚だけ解析します。")
 
-# ----------------- WebRTC 映像処理 -----------------
-class QRTransformer(VideoTransformerBase):
+# ---- WebRTC: プレビューのみ、撮影はボタンで1枚 ----
+class SnapTransformer(VideoTransformerBase):
     def __init__(self):
-        self.detector = cv2.QRCodeDetector()
-        self.last_text = None
+        self.latest_frame = None  # 直近フレーム（BGR）
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
+        self.latest_frame = img  # 常に更新（撮影ボタン押下時に利用）
+        return frame  # 返す映像はそのまま（プレビュー用途）
 
-        # デジタルズーム（ソフト拡大）
-        img = digital_zoom_center(img, zoom=zoom)
-
-        if self.last_text is None:
-            text, test_img, points = decode_once(img, self.detector)
-            if text:
-                self.last_text = text
-                if want_draw_box and points is not None:
-                    draw = img.copy()
-                    for p in points:
-                        p = p.astype(int).reshape(-1, 2)
-                        cv2.polylines(draw, [p], True, (0,255,0), 2)
-                    img = draw
-
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-# カメラ設定：背面カメラ優先・高解像度希望
 webrtc_ctx = webrtc_streamer(
-    key="qr-reader",
+    key="qr-snapshot",
     mode=WebRtcMode.SENDRECV,
-    video_transformer_factory=QRTransformer,
+    video_transformer_factory=SnapTransformer,
     media_stream_constraints={
-        "video": {
-            "width":  {"ideal": 1280},
-            "height": {"ideal": 720},
-            "facingMode": "environment"  # スマホで背面カメラを優先
-        },
+        "video": {"width": {"ideal": 1280}, "height": {"ideal": 720}, "facingMode": "environment"},
         "audio": False,
     },
     async_processing=True,
 )
 
-# 結果の表示
-if webrtc_ctx and webrtc_ctx.video_transformer:
-    if webrtc_ctx.video_transformer.last_text:
-        st.success("読み取り成功!")
-        st.text_input("QR内容", value=webrtc_ctx.video_transformer.last_text)
-        if st.button("もう一度読み取る"):
-            webrtc_ctx.video_transformer.last_text = None
+# ---- 撮影ボタン：最新フレームを1枚だけ解析 ----
+if webrtc_ctx and webrtc_ctx.state.playing:
+    if st.button("📸 撮影"):
+        vt = webrtc_ctx.video_transformer
+        if vt and vt.latest_frame is not None:
+            shot = vt.latest_frame.copy()
+            shot = digital_zoom_center(shot, zoom=zoom)
+
+            with st.spinner("解析中..."):
+                text = decode_once(shot)
+
+            st.image(cv2.cvtColor(shot, cv2.COLOR_BGR2RGB), caption="撮影画像", use_column_width=True)
+            if text:
+                st.success("読み取り成功")
+                st.text_input("QR内容", value=text)
+            else:
+                st.warning("QRを読み取れませんでした。もう一度、明るく近づけて正面から試してください。")
+
+            if stop_after_shot:
+                webrtc_ctx.stop()  # ← 写真モード完了
+        else:
+            st.info("映像がまだ来ていません。数秒待ってから再度お試しください。")
