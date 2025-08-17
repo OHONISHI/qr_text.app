@@ -6,10 +6,14 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 st.set_page_config(page_title="QR撮影（1枚スナップ）")
 
-# --- 初期値 ---
-if "camera_on" not in st.session_state:
-    st.session_state["camera_on"] = True
+# --- セッション初期化 ---
+st.session_state.setdefault("camera_on", True)
+st.session_state.setdefault("qr_text", "")     # ← ここに読み取り結果を保存
+st.session_state.setdefault("shot_image", None)
 
+st.title("QRコードを “撮影” して読み取る")
+
+# ------ ユーティリティ ------
 def digital_zoom_center(bgr, zoom=1.0):
     if zoom <= 1.0: return bgr
     h, w = bgr.shape[:2]
@@ -20,12 +24,13 @@ def digital_zoom_center(bgr, zoom=1.0):
 
 def decode_once(img_bgr):
     det = cv2.QRCodeDetector()
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # そのまま / グレイ / 自適応2値化
     variants = [
         img_bgr,
-        cv2.cvtColor(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
         cv2.cvtColor(cv2.adaptiveThreshold(
-            cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
         ), cv2.COLOR_GRAY2BGR),
     ]
     for var in variants:
@@ -37,12 +42,12 @@ def decode_once(img_bgr):
             return txt
     return ""
 
-st.title("QRコードを “撮影” して読み取る")
-
+# ------ UI（調整） ------
 c1, c2 = st.columns(2)
-zoom = c1.slider("デジタルズーム", 1.0, 2.5, 1.2, 0.1)
+zoom = c1.slider("デジタルズーム", 1.0, 2.5, 1.5, 0.1)
 stop_after_shot = c2.checkbox("撮影後にカメラを停止", True)
 
+# ------ WebRTC（プレビュー＋最新フレーム保持） ------
 class SnapTransformer(VideoTransformerBase):
     def __init__(self):
         self.latest_frame = None
@@ -51,44 +56,11 @@ class SnapTransformer(VideoTransformerBase):
         self.latest_frame = img
         return frame
 
-# --- カメラ（描画/非表示をセッションで制御） ---
 webrtc_ctx = None
 if st.session_state["camera_on"]:
     webrtc_ctx = webrtc_streamer(
         key="qr-snapshot",
         mode=WebRtcMode.SENDRECV,
-        video_transformer_factory=SnapTransformer,
-        media_stream_constraints={
-            "video": {"width": {"ideal": 1280}, "height": {"ideal": 720}, "facingMode": "environment"},
-            "audio": False,
-        },
-        async_processing=True,
-    )
+        video_transformer_
 
-# --- 撮影ボタン ---
-if webrtc_ctx and webrtc_ctx.state.playing:
-    if st.button("📸 撮影"):
-        vt = webrtc_ctx.video_transformer
-        if vt and vt.latest_frame is not None:
-            shot = vt.latest_frame.copy()
-            shot = digital_zoom_center(shot, zoom=zoom)
-            with st.spinner("解析中..."):
-                text = decode_once(shot)
-
-            # ↓ 非推奨を回避：use_container_width に変更
-            st.image(cv2.cvtColor(shot, cv2.COLOR_BGR2RGB),
-                     caption="撮影画像", use_container_width=True)
-
-            if text:
-                st.success("読み取り成功")
-                st.text_input("QR内容", value=text)
-            else:
-                st.warning("QRを読み取れませんでした。明るく・近づけて・正面から再試行してください。")
-
-            # 撮影後に停止（= 次回再実行で webrtc_streamer を描画しない）
-            if stop_after_shot:
-                st.session_state["camera_on"] = False
-                st.rerun()
-        else:
-            st.info("映像の準備中です。数秒待ってから撮影してください。")
 
